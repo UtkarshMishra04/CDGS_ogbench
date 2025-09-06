@@ -43,6 +43,11 @@ config="config/ogb_ant_maze/og_antM_Lg_o15d_PadBuf_Ft64_ts512_DiTd768dp16_fs4_h1
 ## Medium
 # config="config/ogb_ant_maze/og_antM_Me_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
 
+## --------- Training: OGBench AntMaze Explore 2D Planner ----------
+# config="config/ogb_ant_maze_expl/og_antMexpl_Lg_o2d_DiT_ogTr_fs6_ema49_lr01_h192_ovlp66Mdit.py"
+# config="config/ogb_ant_maze_expl/og_antMexpl_Me_o2d_DiT_ogTr_fs6_ema49_lr01_h192_ovlp66Mdit.py"
+
+
 ## --------- Training: OGBench PointMaze Stitch 2D Planner ----------
 ## Giant
 # config="config/ogb_pnt_maze/og_pntM_Gi_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
@@ -51,6 +56,10 @@ config="config/ogb_ant_maze/og_antM_Lg_o15d_PadBuf_Ft64_ts512_DiTd768dp16_fs4_h1
 ## Medium
 # config="config/ogb_pnt_maze/og_pntM_Me_o2d_Cd_Stgl_PadBuf_Ft64_ts512.py"
 
+
+## --------- Training: OGBench AntSoccer Stitch 2D Planner ----------
+# config="config/ogb_ant_soc/og_antSoc_Ar_o17d_DiTd768_PadBuf_Ft64_ts512_fs4_h160_ovlp56MditD384.py"
+# cobfig="config/ogb_ant_soc/og_antSoc_Me_o17d_DiTd768_PadBuf_Ft64_MaxOriPlen200_ts512_fs4_h160_ovlp56MditD384.py"
 
 {
 
