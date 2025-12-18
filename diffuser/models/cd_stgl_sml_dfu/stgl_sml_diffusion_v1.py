@@ -296,7 +296,58 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
             ## normal diffusion
             return x_t_minus_1
 
-    
+    @torch.no_grad()
+    def undo_step_multiple(self, x_p, curr_timestep, prev_timestep):
+        """
+        x_p_list: list of tensor, each is (B,H,dim)
+        returns: noisy sample at previous timestep
+        """
+
+        all_betas = self.betas[curr_timestep+1:prev_timestep+1]
+
+        for beta in all_betas:
+            noise = torch.randn_like(x_p)
+            x_p = (1 - beta) ** 0.5 * x_p + beta**0.5 * noise
+
+        return x_p
+
+    @torch.no_grad
+    def compute_inversion_score_multiple(self, x_p, tj_cond, timesteps):
+        """
+        perform ddim inversion
+        """
+
+        all_timesteps = torch.arange(1, int(self.ddim_num_inference_steps*0.2), device=x_p.device)
+
+        all_model_predictions = []
+
+        for id, t in enumerate(all_timesteps):
+            t_2d = torch.full((x_p.shape[0], self.horizon), t, device=x_p.device, dtype=torch.long)
+
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_next = self.alphas_cumprod[t+1] if t+1 < self.ddim_num_inference_steps else self.final_alpha_cumprod
+            sqrt_alpha_t = torch.sqrt(alpha_t)
+            sqrt_alpha_t_next = torch.sqrt(alpha_t_next)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+            sqrt_one_minus_alpha_t_next = torch.sqrt(1 - alpha_t_next)
+
+            model_mean, _, _, x_recon, pred_epsilon = self.p_mean_variance(
+                x=x_p, t_2d=t_2d, tj_cond=tj_cond, return_modelout=True)
+            
+            x0_pred = (x_p - sqrt_one_minus_alpha_t * pred_epsilon) / sqrt_alpha_t
+            x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+            pred_epsilon = (x_p - sqrt_alpha_t * x0_pred) / sqrt_one_minus_alpha_t
+            x_p = sqrt_alpha_t_next * x0_pred + sqrt_one_minus_alpha_t_next * pred_epsilon
+
+            all_model_predictions.append(pred_epsilon)
+
+        all_intermediate_noise_preds = torch.stack(all_model_predictions, dim=1) # B, n_steps, H, dim
+        derivative = torch.diff(all_intermediate_noise_preds, dim=1) # B, n_steps-1, H, dim
+
+        all_scores = torch.norm(derivative.reshape(x_p.shape[0], -1), dim=1).reshape(x_p.shape[0]) # B,
+
+        return all_scores
+
     def get_tj_cond(self, x, g_cond, timesteps):
         """
         TODO: Directly copy from p_sample_loop, probably we can later use this func in the func
@@ -1721,7 +1772,7 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
 
         x_dfu_all = [x_p_list,]
 
-        assert len(stgl_cond[0]) == shape[0]
+        assert len(stgl_cond[0]) == shape[0], f"{len(stgl_cond[0])} vs {shape[0]}"
 
         ## --- NEW Dec 4 ---
         """1. change the ddim time_dix; 2. change the p_sample
@@ -1733,154 +1784,186 @@ class Stgl_Sml_GauDiffusion_InvDyn_V1(nn.Module):
         ## -----------------
 
         from tqdm import tqdm
-        for i_t in tqdm(time_idx):
+        for id, i_t in enumerate(tqdm(time_idx)):
             
             ## timesteps = torch.full((batch_size,), i, device=device, dtype=torch.long) # old
             ## e.g., (B=10,H=384)
             timesteps = torch.full((batch_size, self.horizon), i_t, device=device, dtype=torch.long)
 
-            ## x_p_list ## to be given to the denoiser at this step
-            x_p_list_next_t = [None for _ in range(n_comp)] ## after denoise this step, aka., less noisy
+            inversion_scores = [None for _ in range(n_comp)]
 
-            ## Do the Averaging First
-            ## x_p_list[0].shape: Size([40, 40, 2])
-            ## x_p_list[1][0][:self.len_ovlp_cd]
-            ## x_p_list[0][0][-self.len_ovlp_cd:]
-            # pdb.set_trace()
-            x_p_list = self.avg_ovlp_chunk_GSC(x_p_list)
-            # pdb.set_trace()
+            U = 10
+            for u_t in tqdm(range(U)):
+                ## x_p_list ## to be given to the denoiser at this step
+                x_p_list_next_t = [None for _ in range(n_comp)] ## after denoise this step, aka., less noisy
 
-            ## iteratively denoise each sub traj
-            for i_tj in range(n_comp):
-                ## target traj
-                x_p_i = x_p_list[i_tj]
+                ## Do the Averaging First
+                ## x_p_list[0].shape: Size([40, 40, 2])
+                ## x_p_list[1][0][:self.len_ovlp_cd]
+                ## x_p_list[0][0][-self.len_ovlp_cd:]
+                # pdb.set_trace()
+                x_p_list = self.avg_ovlp_chunk_GSC(x_p_list)
+                # pdb.set_trace()
 
-                if i_tj == 0:
-                    ## first one
-                    x_p_i_plus_1 = x_p_list[i_tj+1]
-                    st_traj_2, _ = self.extract_ovlp_from_full(x_p_i_plus_1)
+                ## iteratively denoise each sub traj
+                for i_tj in range(n_comp):
+                    ## target traj
+                    x_p_i = x_p_list[i_tj]
 
-                    x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
-                        x_et=x_p_i,
-                        st_traj=None,
-                        end_traj=st_traj_2,
-                        t_1d_st=timesteps[:,0], ## placeholder
-                        t_1d_end=timesteps[:,0], 
-                        # is_rand=True,
-                        t_type='0', # g_cond['t_type'], ## 0 
-                        is_noisy=True,
-                        stgl_cond={0:stgl_cond[0]}
-                        )
+                    if i_tj == 0:
+                        ## first one
+                        x_p_i_plus_1 = x_p_list[i_tj+1]
+                        st_traj_2, _ = self.extract_ovlp_from_full(x_p_i_plus_1)
+
+                        x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
+                            x_et=x_p_i,
+                            st_traj=None,
+                            end_traj=st_traj_2,
+                            t_1d_st=timesteps[:,0], ## placeholder
+                            t_1d_end=timesteps[:,0], 
+                            # is_rand=True,
+                            t_type='0', # g_cond['t_type'], ## 0 
+                            is_noisy=True,
+                            stgl_cond={0:stgl_cond[0]}
+                            )
+                        
+                        # tj_cond_p_i['end_ovlp_is_drop'] = None
+                        tj_cond_p_i['end_ovlp_is_drop'] = None
+                        # pdb.set_trace() ## st_ovlp as well and is_inpat
+
+                        ## only used in the half_fd duplicate for faster cls-free
+                        tj_cond_p_i['do_cond'] = False
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
+
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+                        
+                        # x_p_list[i_tj] = x_p_i
+                        ## x_p_list (old list): still save the samples
+                        ## put the less noisy sample in the new list
                     
-                    # tj_cond_p_i['end_ovlp_is_drop'] = None
-                    tj_cond_p_i['end_ovlp_is_drop'] = None
-                    # pdb.set_trace() ## st_ovlp as well and is_inpat
+                    elif i_tj > 0 and i_tj < n_comp-1:
+                        ## intermediate one
+                        # x_p_i_minus_1 = x_p_list[ i_tj - 1 ]
+                        # _, end_traj_i_minus_1 = self.extract_ovlp_from_full(x_p_i_minus_1)
 
-                    ## only used in the half_fd duplicate for faster cls-free
-                    tj_cond_p_i['do_cond'] = False
-                    if do_mcmc:
-                        x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
+                        # x_p_i_plus_1 = x_p_list[ i_tj + 1 ]
+                        # st_traj_i_plus_1, _ = self.extract_ovlp_from_full(x_p_i_plus_1)
 
-                    if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
-                    else:
-                        x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+                        # x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
+                        #     x_et=x_p_i,
+                        #     st_traj=end_traj_i_minus_1,
+                        #     end_traj=st_traj_i_plus_1,
+                        #     t_1d_st=timesteps[:,0], ## same noisy level
+                        #     t_1d_end=timesteps[:,0], 
+                        #     # is_rand=True,
+                        #     t_type='0', # g_cond['t_type'], ## 0 
+                        #     is_noisy=True,
+                        #     stgl_cond={},
+                        # )
+
+
+                        ## Drop everything because for intermediate chunks,
+                        ## we are using inpainting w/ uncond generation
+                        tj_cond_p_i = dict(
+                            st_ovlp_is_drop=None, end_ovlp_is_drop=None, 
+                            is_st_inpat=torch.zeros_like(x_p_i[:,0,0]).to(torch.bool),
+                            is_end_inpat=torch.zeros_like(x_p_i[:,0,0]).to(torch.bool),
+                        )
+
+                        tj_cond_p_i['do_cond'] = False
+
+                        # pdb.set_trace()
+
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
+
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+
+                    elif i_tj == n_comp - 1:
+                        ## last one
+
+                        x_p_i_minus_1 = x_p_list[ i_tj - 1 ]
+                        _,  end_traj_i_minus_1 = self.extract_ovlp_from_full(x_p_i_minus_1)
+
+                        x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
+                            x_et=x_p_i,
+                            st_traj=end_traj_i_minus_1,
+                            end_traj=None,
+                            t_1d_st=timesteps[:,0],
+                            t_1d_end=timesteps[:,0], ## placeholder
+                            # is_rand=True,
+                            t_type='0', # g_cond['t_type'], ## 0 
+                            is_noisy=True,
+                            stgl_cond={hzn-1:stgl_cond[hzn-1]}
+                            )
+                        
+
+                        tj_cond_p_i['st_ovlp_is_drop'] = None
+                        
+                        # tj_cond_p_i['do_cond'] = True
+                        tj_cond_p_i['do_cond'] = False
+
+                        # pdb.set_trace() ## TODO: Jan 24 Check Back all tj_cond
+
+                        if do_mcmc:
+                            x_p_i = self.resample_same_t_mcmc( x_p_i, tj_cond_p_i, timesteps )
+
+                        if self.use_ddim:
+                            x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
+                        else:
+                            x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+
+                    if id < len(time_idx) - 1 and u_t < U - 1:
+                        # undo denoising step
+                        curr_timestep = time_idx[id]
+                        prev_timestep = time_idx[id + 1]
+                        x_p_i = self.undo_step_multiple(x_p_i, prev_timestep, curr_timestep)
                     
                     # x_p_list[i_tj] = x_p_i
-                    ## x_p_list (old list): still save the samples
-                    ## put the less noisy sample in the new list
                     x_p_list_next_t[i_tj] = x_p_i
+
+                    if u_t == U - 1 and id > 0.94*len(time_idx):
+                        inversion_scores[i_tj] = self.compute_inversion_score_multiple(x_p_i, tj_cond_p_i, timesteps)
+
                 
-                elif i_tj > 0 and i_tj < n_comp-1:
-                    ## intermediate one
-                    # x_p_i_minus_1 = x_p_list[ i_tj - 1 ]
-                    # _, end_traj_i_minus_1 = self.extract_ovlp_from_full(x_p_i_minus_1)
+                ## important: NEW assign the next_t to cur_t for denosing at the next timestep
+                x_p_list = x_p_list_next_t
 
-                    # x_p_i_plus_1 = x_p_list[ i_tj + 1 ]
-                    # st_traj_i_plus_1, _ = self.extract_ovlp_from_full(x_p_i_plus_1)
+            if id > 0.94*len(time_idx):
+                cummulative_score = []
+                for i_tj in range(n_comp):
+                    cummulative_score.append(inversion_scores[i_tj])
 
-                    # x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
-                    #     x_et=x_p_i,
-                    #     st_traj=end_traj_i_minus_1,
-                    #     end_traj=st_traj_i_plus_1,
-                    #     t_1d_st=timesteps[:,0], ## same noisy level
-                    #     t_1d_end=timesteps[:,0], 
-                    #     # is_rand=True,
-                    #     t_type='0', # g_cond['t_type'], ## 0 
-                    #     is_noisy=True,
-                    #     stgl_cond={},
-                    # )
+                avg_score = torch.stack(cummulative_score, dim=1).mean(dim=1)  # (B,)
+                # select top 10% indices with lowest scores
+                topk = max(1, int(0.1 * avg_score.shape[0]))
+                _, selected_indices = torch.topk(-avg_score, topk)  # negative for lowest scores
 
-
-                    ## Drop everything because for intermediate chunks,
-                    ## we are using inpainting w/ uncond generation
-                    tj_cond_p_i = dict(
-                        st_ovlp_is_drop=None, end_ovlp_is_drop=None, 
-                        is_st_inpat=torch.zeros_like(x_p_i[:,0,0]).to(torch.bool),
-                        is_end_inpat=torch.zeros_like(x_p_i[:,0,0]).to(torch.bool),
-                    )
-
-                    tj_cond_p_i['do_cond'] = False
-
-                    # pdb.set_trace()
-
-                    if do_mcmc:
-                        x_p_i = self.resample_same_t_mcmc(x_p_i, tj_cond_p_i, timesteps)
-
-                    if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
-                    else:
-                        x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
+                for i_tj in range(n_comp):
+                    x_p = x_p_list[i_tj]
+                    x_p = x_p[selected_indices]
                     
-                    # x_p_list[i_tj] = x_p_i
-                    x_p_list_next_t[i_tj] = x_p_i
+                    # repopulate x_p to match same batch size
+                    bs = shape[0]
+                    current_bs = x_p.shape[0]
+                    while x_p.shape[0] < bs:
+                        x_p = torch.cat([x_p, x_p], dim=0)
 
-                elif i_tj == n_comp - 1:
-                    ## last one
-
-                    x_p_i_minus_1 = x_p_list[ i_tj - 1 ]
-                    _,  end_traj_i_minus_1 = self.extract_ovlp_from_full(x_p_i_minus_1)
-
-                    x_p_i, tj_cond_p_i = self.create_eval_tj_cond(
-                        x_et=x_p_i,
-                        st_traj=end_traj_i_minus_1,
-                        end_traj=None,
-                        t_1d_st=timesteps[:,0],
-                        t_1d_end=timesteps[:,0], ## placeholder
-                        # is_rand=True,
-                        t_type='0', # g_cond['t_type'], ## 0 
-                        is_noisy=True,
-                        stgl_cond={hzn-1:stgl_cond[hzn-1]}
-                        )
-                    
-
-                    tj_cond_p_i['st_ovlp_is_drop'] = None
-                    
-                    # tj_cond_p_i['do_cond'] = True
-                    tj_cond_p_i['do_cond'] = False
-
-                    # pdb.set_trace() ## TODO: Jan 24 Check Back all tj_cond
-
-                    if do_mcmc:
-                        x_p_i = self.resample_same_t_mcmc( x_p_i, tj_cond_p_i, timesteps )
-
-                    if self.use_ddim:
-                        x_p_i = self.ddim_p_sample(x_p_i, tj_cond_p_i, timesteps, self.ddim_eta, use_clipped_model_output=True)
-                    else:
-                        x_p_i = self.p_sample(x_p_i, tj_cond_p_i, timesteps)
-                    
-                    # x_p_list[i_tj] = x_p_i
-                    x_p_list_next_t[i_tj] = x_p_i
-            
-            ## important: NEW assign the next_t to cur_t for denosing at the next timestep
-            x_p_list = x_p_list_next_t
+                    x_p = x_p[:bs]
+                    x_p_list[i_tj] = x_p
 
             if return_diffusion:
                 x_dfu_all.append([_ for _ in x_p_list])
 
 
-        #### -----------
-            
+        #### -----------            
         
         ## Finished
         x_p_list[0] = apply_conditioning(x_p_list[0], {0:stgl_cond[0]}, 0)
