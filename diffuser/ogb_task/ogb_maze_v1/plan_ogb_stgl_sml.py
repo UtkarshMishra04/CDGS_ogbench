@@ -739,6 +739,7 @@ if __name__ == '__main__':
     else:
         args.env_n_max_steps = None ## use ogb default ??
 
+    args.ev_cp_infer_t_type = 'gsc'
 
     sub_dir = f'{datetime.now().strftime("%y%m%d-%H%M%S-%f")[:-3]}' + \
                         f"-nm{int(args.plan_n_ep)}-ems{args.env_n_max_steps//1000}k" + \

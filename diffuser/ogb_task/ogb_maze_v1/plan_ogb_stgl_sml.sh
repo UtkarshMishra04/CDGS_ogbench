@@ -1,29 +1,18 @@
 #!/bin/bash
 
-#SBATCH --job-name=script-ev-hi
-#SBATCH --output=trash/slurm/plan_OG_StglSml_Jan27/slurm-%j.out
+#SBATCH --job-name=ogb_scene
+#SBATCH --output=logs/ogb_scene_%j.out
+#SBATCH --error=logs/ogb_scene_%j.err
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-### brainiac, 2080: alexa,alexa
-#SBATCH --exclude="clippy,voltron,claptrap,alexa,bmo,olivaw,oppy"
-
-##SBATCH --partition="rl2-lab"
-
-#SBATCH --gres=gpu:a40:1
-##SBATCH --gres=gpu:l40s:1
-##SBATCH --qos="short"
-
-##SBATCH --gres=gpu:rtx_6000:1
-##SBATCH --gres=gpu:a5000:1
-
-#SBATCH --qos="debug"
-#SBATCH --time=16:00:00
+#SBATCH --time=10:00:00
+#SBATCH --qos=inferno
+#SBATCH --gres=gpu:v100:1
+#SBATCH --account=gts-dxu345-rl2
 
 echo $(hostname)
 
 source ~/.bashrc
-source activate compdfu_ogb_release
+source .venv/bin/activate
 
 # config=""
 
